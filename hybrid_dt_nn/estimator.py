@@ -165,32 +165,9 @@ class HybridTreeRegressor(RegressorMixin, BaseEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
-        """Predict target values for X."""
+    def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self, 'dt_')
-        X = check_array(X)
-        
-        # Base predictions from DT (used as fallback)
-        dt_preds = self.dt_.predict(X)
-        
-        # Get leaf assignments
-        leaf_ids = self.dt_.apply(X)
-        
-        final_preds = np.zeros(len(X))
-        
-        # Vectorized batch prediction by leaf
-        for leaf in np.unique(leaf_ids):
-            idx = np.where(leaf_ids == leaf)[0]
-            if leaf in self.leaf_models_:
-                # Route to specific Neural Network and predict batch
-                nn = self.leaf_models_[leaf]
-                leaf_preds = nn.predict(X[idx], verbose=0).flatten()
-                final_preds[idx] = leaf_preds
-            else:
-                # Fallback to Decision Tree batch
-                final_preds[idx] = dt_preds[idx]
-                
-        return final_preds
-        
+        return self.dt_.predict(X)
     def _build_keras_model(self, input_dim, hidden_layers, units, activation, optimizer, lr=None):
         """Builds a Keras Sequential model with specific parameters."""
         model = keras.Sequential()
@@ -264,7 +241,57 @@ class HybridTreeRegressor(RegressorMixin, BaseEstimator):
         
         return final_model, val_mse, fixed_params
 
-
-    def predict(self, X: Any) -> np.ndarray:
-        check_is_fitted(self, 'dt_')
-        return self.dt_.predict(X)
+    def _train_with_hpo(self, X_leaf, y_leaf):
+        """Runs Optuna HPO to find the best NN architecture for this specific leaf."""
+        X_t, X_v, y_t, y_v = train_test_split(X_leaf, y_leaf, test_size=0.2, random_state=self.random_state)
+        
+        def objective(trial):
+            keras.backend.clear_session()
+            # Rich, constrained Optuna search space
+            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "rmsprop", "nadam"])
+            activation = trial.suggest_categorical("activation", ["relu", "leaky_relu", "elu", "tanh", "swish"])
+            hidden_layers = trial.suggest_int("hidden_layers", 1, 5)
+            units = trial.suggest_categorical("units", [8, 16, 32, 64, 128])
+            lr = trial.suggest_categorical("learning_rate", [1e-4, 3e-4, 1e-3, 3e-3])
+            batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+            
+            model = self._build_keras_model(
+                input_dim=X_t.shape[1], 
+                hidden_layers=hidden_layers, 
+                units=units, 
+                activation=activation, 
+                optimizer=optimizer,
+                lr=lr
+            )
+            
+            early_stopping = keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=5, restore_best_weights=True
+            )
+                
+            model.fit(X_t, y_t, validation_data=(X_v, y_v), epochs=self.nn_epochs, 
+                      batch_size=batch_size, callbacks=[early_stopping], verbose=0)
+                      
+            preds = model.predict(X_v, verbose=0).flatten()
+            return mean_squared_error(y_v, preds)
+            
+        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=self.random_state))
+        study.optimize(objective, n_trials=self.hpo_trials)
+        
+        best_params = study.best_trial.params
+        final_val_mse = study.best_value
+        
+        keras.backend.clear_session()
+        final_model = self._build_keras_model(
+            input_dim=X_t.shape[1],
+            hidden_layers=best_params["hidden_layers"],
+            units=best_params["units"],
+            activation=best_params["activation"],
+            optimizer=best_params["optimizer"],
+            lr=best_params["learning_rate"]
+        )
+        
+        # Retrain FINAL model on the complete leaf (X_leaf, y_leaf)
+        final_model.fit(X_leaf, y_leaf, epochs=self.nn_epochs, 
+                        batch_size=best_params["batch_size"], verbose=0)
+                        
+        return final_model, final_val_mse, best_params
