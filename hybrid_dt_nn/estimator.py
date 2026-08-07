@@ -131,7 +131,139 @@ class HybridTreeRegressor(RegressorMixin, BaseEstimator):
         logger.info(f"2. Training Neural Networks (use_hpo={self.use_hpo})...")
             
         for i, leaf_id in enumerate(self.leaf_ids_, 1):
+            idx = np.where(leaf_ids == leaf_id)[0]
+            n_samples = len(idx)
+            self.leaf_sample_counts_[leaf_id] = n_samples
+            
+            if n_samples >= self.nn_min_samples:
+                X_leaf = X[idx]
+                y_leaf = y[idx]
+                
+                logger.info(f"Training NN {i}/{len(self.leaf_ids_)} (Leaf {leaf_id}, {n_samples} samples)...")
+                
+                if self.use_hpo:
+                    nn, val_mse, best_params = self._train_with_hpo(X_leaf, y_leaf)
+                else:
+                    nn, val_mse, best_params = self._train_fixed_nn(X_leaf, y_leaf)
+                
+                self.leaf_models_[leaf_id] = nn
+                self.leaf_metrics_[leaf_id] = {
+                    "samples": n_samples,
+                    "val_mse": val_mse,
+                    "nn_used": True,
+                    "best_params": best_params
+                }
+            else:
+                self.leaf_metrics_[leaf_id] = {
+                    "samples": n_samples,
+                    "val_mse": None,
+                    "nn_used": False,
+                    "best_params": None
+                }
+                    
+        logger.info("Training complete!")
         return self
+
+    def predict(self, X: Any) -> np.ndarray:
+        """Predict target values for X."""
+        check_is_fitted(self, 'dt_')
+        X = check_array(X)
+        
+        # Base predictions from DT (used as fallback)
+        dt_preds = self.dt_.predict(X)
+        
+        # Get leaf assignments
+        leaf_ids = self.dt_.apply(X)
+        
+        final_preds = np.zeros(len(X))
+        
+        # Vectorized batch prediction by leaf
+        for leaf in np.unique(leaf_ids):
+            idx = np.where(leaf_ids == leaf)[0]
+            if leaf in self.leaf_models_:
+                # Route to specific Neural Network and predict batch
+                nn = self.leaf_models_[leaf]
+                leaf_preds = nn.predict(X[idx], verbose=0).flatten()
+                final_preds[idx] = leaf_preds
+            else:
+                # Fallback to Decision Tree batch
+                final_preds[idx] = dt_preds[idx]
+                
+        return final_preds
+        
+    def _build_keras_model(self, input_dim, hidden_layers, units, activation, optimizer, lr=None):
+        """Builds a Keras Sequential model with specific parameters."""
+        model = keras.Sequential()
+        model.add(keras.layers.InputLayer(shape=(input_dim,)))
+        
+        # Handle custom activations (e.g., leaky_relu in strings)
+        for _ in range(hidden_layers):
+            if activation == "leaky_relu":
+                model.add(keras.layers.Dense(units))
+                model.add(keras.layers.LeakyReLU())
+            else:
+                model.add(keras.layers.Dense(units, activation=activation))
+            
+        model.add(keras.layers.Dense(1)) # Regression output
+        
+        # Configure optimizer
+        if lr is not None:
+            if optimizer == 'adam': opt = keras.optimizers.Adam(learning_rate=lr)
+            elif optimizer == 'adamw': opt = keras.optimizers.AdamW(learning_rate=lr)
+            elif optimizer == 'rmsprop': opt = keras.optimizers.RMSprop(learning_rate=lr)
+            elif optimizer == 'nadam': opt = keras.optimizers.Nadam(learning_rate=lr)
+            else: opt = optimizer
+        else:
+            opt = optimizer
+            
+        model.compile(optimizer=opt, loss='mse')
+        return model
+
+    def _train_fixed_nn(self, X_leaf, y_leaf):
+        """Trains a fixed architecture NN with early stopping and validation."""
+        keras.backend.clear_session()
+        X_t, X_v, y_t, y_v = train_test_split(X_leaf, y_leaf, test_size=0.2, random_state=self.random_state)
+        
+        model = self._build_keras_model(
+            input_dim=X_leaf.shape[1], 
+            hidden_layers=self.nn_hidden_layers, 
+            units=self.nn_units, 
+            activation='relu', 
+            optimizer='adam'
+        )
+        
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=5, restore_best_weights=True
+        )
+        
+        model.fit(X_t, y_t, validation_data=(X_v, y_v), epochs=self.nn_epochs, 
+                  batch_size=self.nn_batch_size, callbacks=[early_stopping], verbose=0)
+                  
+        preds = model.predict(X_v, verbose=0).flatten()
+        val_mse = mean_squared_error(y_v, preds)
+        
+        # Retrain FINAL model on the complete leaf
+        keras.backend.clear_session()
+        final_model = self._build_keras_model(
+            input_dim=X_leaf.shape[1], 
+            hidden_layers=self.nn_hidden_layers, 
+            units=self.nn_units, 
+            activation='relu', 
+            optimizer='adam'
+        )
+        final_model.fit(X_leaf, y_leaf, epochs=self.nn_epochs, 
+                        batch_size=self.nn_batch_size, verbose=0)
+        
+        fixed_params = {
+            "optimizer": "adam",
+            "activation": "relu",
+            "hidden_layers": self.nn_hidden_layers,
+            "units": self.nn_units,
+            "batch_size": self.nn_batch_size
+        }
+        
+        return final_model, val_mse, fixed_params
+
 
     def predict(self, X: Any) -> np.ndarray:
         check_is_fitted(self, 'dt_')
