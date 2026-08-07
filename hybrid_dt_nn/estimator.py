@@ -165,9 +165,32 @@ class HybridTreeRegressor(RegressorMixin, BaseEstimator):
         return self
 
     def predict(self, X: Any) -> np.ndarray:
-    def predict(self, X: Any) -> np.ndarray:
+        """Predict target values for X."""
         check_is_fitted(self, 'dt_')
-        return self.dt_.predict(X)
+        X = check_array(X)
+        
+        # Base predictions from DT (used as fallback)
+        dt_preds = self.dt_.predict(X)
+        
+        # Get leaf assignments
+        leaf_ids = self.dt_.apply(X)
+        
+        final_preds = np.zeros(len(X))
+        
+        # Vectorized batch prediction by leaf
+        for leaf in np.unique(leaf_ids):
+            idx = np.where(leaf_ids == leaf)[0]
+            if leaf in self.leaf_models_:
+                # Route to specific Neural Network and predict batch
+                nn = self.leaf_models_[leaf]
+                leaf_preds = nn.predict(X[idx], verbose=0).flatten()
+                final_preds[idx] = leaf_preds
+            else:
+                # Fallback to Decision Tree batch
+                final_preds[idx] = dt_preds[idx]
+                
+        return final_preds
+        
     def _build_keras_model(self, input_dim, hidden_layers, units, activation, optimizer, lr=None):
         """Builds a Keras Sequential model with specific parameters."""
         model = keras.Sequential()
